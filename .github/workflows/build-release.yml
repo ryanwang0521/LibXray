@@ -1,0 +1,162 @@
+name: Build and Release
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Force rebuild even if release already exists
+        type: boolean
+        default: false
+
+concurrency:
+  group: libxray-build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+    steps:
+      - name: Check upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag=$(gh api repos/XTLS/libXray/releases/latest --jq -r .tag_name)
+          version="${upstream_tag#v}"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $upstream_tag (SPM version: $version)"
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "Force rebuild requested."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$version" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $version already exists. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $version not found. Will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-apple:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout libXray source
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/libXray
+          ref: ${{ needs.check-version.outputs.upstream_tag }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: false
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build XCFramework
+        env:
+          LIBXRAY_GOMOBILE_VERSION: latest
+        run: python3 build/main.py apple gomobile
+
+      - name: Package XCFramework
+        run: zip -r LibXray.xcframework.zip LibXray.xcframework
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libxray-xcframework
+          path: LibXray.xcframework.zip
+          if-no-files-found: error
+
+  release:
+    needs:
+      - check-version
+      - build-apple
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout distribution repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download XCFramework artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libxray-xcframework
+
+      - name: Compute checksum and update Package.swift
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          checksum=$(swift package compute-checksum LibXray.xcframework.zip)
+          url="https://github.com/${{ github.repository }}/releases/download/${VERSION}/LibXray.xcframework.zip"
+          cat > Package.swift <<EOF
+          // swift-tools-version:5.7
+          import PackageDescription
+
+          let package = Package(
+              name: "LibXray",
+              products: [
+                  .library(
+                      name: "LibXray",
+                      targets: ["LibXray"]
+                  )
+              ],
+              targets: [
+                  .binaryTarget(
+                      name: "LibXray",
+                      url: "${url}",
+                      checksum: "${checksum}"
+                  )
+              ]
+          )
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: LibXray ${{ needs.check-version.outputs.version }}
+          files: LibXray.xcframework.zip
+          generate_release_notes: true
+          make_latest: true
+
+      - name: Commit updated Package.swift
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          if git diff --cached --quiet; then
+            echo "Package.swift unchanged."
+            exit 0
+          fi
+          git commit -m "Release ${VERSION}"
+          git push
