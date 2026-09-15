@@ -29,11 +29,11 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
         run: |
           set -euo pipefail
 
-          upstream_tag=$(gh api repos/XTLS/libXray/releases/latest --jq -r .tag_name)
+          upstream_tag=$(gh api repos/XTLS/libXray/releases/latest --jq .tag_name)
           version="${upstream_tag#v}"
           echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
